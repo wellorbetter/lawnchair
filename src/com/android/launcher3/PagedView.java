@@ -52,7 +52,6 @@ import android.widget.ScrollView;
 
 import androidx.annotation.Nullable;
 
-import app.lawnchair.preferences2.PreferenceManager2;
 import com.android.launcher3.compat.AccessibilityManagerCompat;
 import com.android.launcher3.config.FeatureFlags;
 import com.android.launcher3.pageindicators.PageIndicator;
@@ -63,11 +62,9 @@ import com.android.launcher3.util.IntSet;
 import com.android.launcher3.util.Thunk;
 import com.android.launcher3.views.ActivityContext;
 
-import com.patrykmichalik.opto.core.PreferenceExtensionsKt;
 import java.util.ArrayList;
 import java.util.function.Consumer;
 
-import app.lawnchair.preferences.PreferenceManager;
 import app.lawnchair.ui.StretchEdgeEffect;
 
 /**
@@ -89,9 +86,6 @@ public abstract class PagedView<T extends View & PageIndicator> extends ViewGrou
 
     private static final float MAX_SCROLL_PROGRESS = 1.0f;
     
-    private final PreferenceManager prefs = PreferenceManager.getInstance(getContext());
-    private final PreferenceManager2 prefs2 = PreferenceManager2.getInstance(getContext());
-
     private boolean mFreeScroll = false;
 
     private int mFlingThresholdVelocity;
@@ -135,13 +129,10 @@ public abstract class PagedView<T extends View & PageIndicator> extends ViewGrou
     @Nullable protected int[] mPageScrolls = null;
     private boolean mIsBeingDragged;
 
-    private int mWrapToPage = INVALID_PAGE;
-    private int mSavedMinScroll;
-    private int mSavedMaxScroll;
-    private boolean mCachedEnableFeed;
+    private final WrapScrollController mWrapScroll = new WrapScrollController();
 
     private boolean isWrapScrolling() {
-        return mWrapToPage != INVALID_PAGE;
+        return mWrapScroll.isActive();
     }
 
     // The amount of movement to begin scrolling
@@ -288,9 +279,7 @@ public abstract class PagedView<T extends View & PageIndicator> extends ViewGrou
 
     private void abortScrollerAnimation(boolean resetNextPage) {
         mScroller.abortAnimation();
-        if (isWrapScrolling()) {
-            finalizeWrapScroll();
-        }
+        mWrapScroll.onScrollerStopped();
         onScrollerAnimationAborted();
         // We need to clean up the next page here to avoid computeScrollHelper from
         // updating current page on the pass.
@@ -306,9 +295,7 @@ public abstract class PagedView<T extends View & PageIndicator> extends ViewGrou
      */
     public void forceFinishScroller() {
         mScroller.forceFinished(true);
-        if (isWrapScrolling()) {
-            finalizeWrapScroll();
-        }
+        mWrapScroll.onScrollerStopped();
         // We need to clean up the next page here to avoid computeScrollHelper from
         // updating current page on the pass.
         mNextPage = INVALID_PAGE;
@@ -343,6 +330,16 @@ public abstract class PagedView<T extends View & PageIndicator> extends ViewGrou
      */
     protected int getPanelCount() {
         return 1;
+    }
+
+    /** Returns whether this paged view supports wrapping between its first and last pages. */
+    protected boolean isPageWrappingEnabled() {
+        return false;
+    }
+
+    /** Returns whether wrapping from the first page to the last page is currently allowed. */
+    protected boolean canWrapFromFirstPage() {
+        return true;
     }
 
     /**
@@ -1105,6 +1102,10 @@ public abstract class PagedView<T extends View & PageIndicator> extends ViewGrou
             }
 
             case MotionEvent.ACTION_DOWN: {
+                if (mWrapScroll.isSettling()) {
+                    abortScrollerAnimation(false);
+                }
+                mWrapScroll.beginGesture();
                 final float x = ev.getX();
                 final float y = ev.getY();
                 // Remember location of down touch
@@ -1245,16 +1246,7 @@ public abstract class PagedView<T extends View & PageIndicator> extends ViewGrou
      * correct on-screen location of the wrap target.
      */
     private int getVisualScrollForPage(int index) {
-        int scroll = getScrollForPage(index);
-        if (isWrapScrolling() && index == mWrapToPage) {
-            int totalWidth = mSavedMaxScroll - mSavedMinScroll + getOnePageDistance();
-            if ((mWrapToPage == 0) != mIsRtl) {
-                scroll += totalWidth;
-            } else {
-                scroll -= totalWidth;
-            }
-        }
-        return scroll;
+        return getScrollForPage(index) + mWrapScroll.getTranslationForPage(index);
     }
 
     // While layout transitions are occurring, a child's position may stray from its baseline
@@ -1269,9 +1261,7 @@ public abstract class PagedView<T extends View & PageIndicator> extends ViewGrou
             int baselineX = mPageScrolls[index] + scrollOffset;
             float childX = child.getX();
             // Wrap-scroll's translationX isn't a layout transition; don't let it skew parallax offset.
-            if (isWrapScrolling() && index == mWrapToPage) {
-                childX -= child.getTranslationX();
-            }
+            childX -= mWrapScroll.getTranslationForPage(index);
             return (int) (childX - baselineX);
         }
     }
@@ -1312,6 +1302,10 @@ public abstract class PagedView<T extends View & PageIndicator> extends ViewGrou
 
         switch (action & MotionEvent.ACTION_MASK) {
         case MotionEvent.ACTION_DOWN:
+            mWrapScroll.ensureGestureStarted();
+            if (mWrapScroll.isSettling()) {
+                abortScrollerAnimation(false);
+            }
             updateIsBeingDraggedOnTouchDown(ev);
 
             /*
@@ -1330,7 +1324,6 @@ public abstract class PagedView<T extends View & PageIndicator> extends ViewGrou
             mTotalMotion = 0;
             mAllowEasyFling = false;
             mActivePointerId = ev.getPointerId(0);
-            mCachedEnableFeed = PreferenceExtensionsKt.firstBlocking(prefs2.getEnableFeed());
             if (mIsBeingDragged) {
                 pageBeginTransition();
             }
@@ -1382,21 +1375,7 @@ public abstract class PagedView<T extends View & PageIndicator> extends ViewGrou
                 mLastMotion = direction;
 
                 if (delta != 0) {
-                    if (prefs.getInfiniteScrolling().get() && !mFreeScroll && getChildCount() > 1) {
-                        boolean enableFeed = mCachedEnableFeed;
-                        float pulledTo = oldScroll + delta;
-                        if (!isWrapScrolling() && mCurrentPage == getChildCount() - 1) {
-                            boolean pastEnd = mIsRtl ? pulledTo < mMinScroll : pulledTo > mMaxScroll;
-                            if (pastEnd) {
-                                startWrapDrag(0);
-                            }
-                        } else if (!isWrapScrolling() && mCurrentPage == 0 && !enableFeed) {
-                            boolean pastStart = mIsRtl ? pulledTo > mMaxScroll : pulledTo < mMinScroll;
-                            if (pastStart) {
-                                startWrapDrag(getChildCount() - 1);
-                            }
-                        }
-                    }
+                    mWrapScroll.maybeStartDrag(oldScroll, delta);
 
                     mOrientationHandler.setPrimary(this, VIEW_SCROLL_BY, delta);
 
@@ -1477,53 +1456,27 @@ public abstract class PagedView<T extends View & PageIndicator> extends ViewGrou
                     // test for a large move if a fling has been registered. That is, a large
                     // move to the left and fling to the right will register as a fling to the right.
 
-                    boolean infiniteScroll = prefs.getInfiniteScrolling().get();
-                    boolean enableFeed = mCachedEnableFeed;
-
                     if (((isSignificantMove && !isDeltaLeft && !isFling) ||
                             (isFling && !isVelocityLeft)) && mCurrentPage > 0) {
-                        if (isWrapScrolling()) {
-                            cancelWrapScroll();
-                        }
                         finalPage = returnToOriginalPage
                                 ? mCurrentPage : mCurrentPage - getPanelCount();
-                        runOnPageScrollsInitialized(
-                                () -> snapToPageWithVelocity(finalPage, velocity));
-                    } else if (((isSignificantMove && isDeltaLeft && !isFling) || (isFling && isVelocityLeft)) && mCurrentPage < getChildCount() - 1) {
-                        if (isWrapScrolling()) {
-                            cancelWrapScroll();
-                        }
+                        snapAfterDrag(finalPage, velocity, false);
+                    } else if (((isSignificantMove && isDeltaLeft && !isFling)
+                            || (isFling && isVelocityLeft))
+                            && mCurrentPage < mWrapScroll.getLastPage()) {
                         finalPage = returnToOriginalPage ? mCurrentPage : mCurrentPage + getPanelCount();
-                        runOnPageScrollsInitialized(() -> snapToPageWithVelocity(finalPage, velocity));
-					} else if (mCurrentPage == getChildCount() - 1 && infiniteScroll) {
+                        snapAfterDrag(finalPage, velocity, false);
+                    } else if (mCurrentPage == mWrapScroll.getLastPage()
+                            && mWrapScroll.isEnabledForGesture()) {
                         finalPage = returnToOriginalPage ? mCurrentPage : 0;
-                        if (!returnToOriginalPage) {
-                            runOnPageScrollsInitialized(
-                                    () -> snapToPageWrapped(finalPage, velocity));
-                        } else {
-                            if (isWrapScrolling()) {
-                                cancelWrapScroll();
-                            }
-                            runOnPageScrollsInitialized(
-                                    () -> snapToPageWithVelocity(finalPage, velocity));
-                        }
-                    } else if (mCurrentPage == 0 && infiniteScroll && !enableFeed) {
-                        finalPage = returnToOriginalPage ? mCurrentPage : getChildCount() - 1;
-                        if (!returnToOriginalPage) {
-                            runOnPageScrollsInitialized(
-                                    () -> snapToPageWrapped(finalPage, velocity));
-                        } else {
-                            if (isWrapScrolling()) {
-                                cancelWrapScroll();
-                            }
-                            runOnPageScrollsInitialized(
-                                    () -> snapToPageWithVelocity(finalPage, velocity));
-                        }
+                        snapAfterDrag(finalPage, velocity, !returnToOriginalPage);
+                    } else if (mCurrentPage == 0
+                            && mWrapScroll.canWrapFromFirstPageForGesture()) {
+                        finalPage = returnToOriginalPage
+                                ? mCurrentPage : mWrapScroll.getLastPage();
+                        snapAfterDrag(finalPage, velocity, !returnToOriginalPage);
                     } else {
-                        if (isWrapScrolling()) {
-                            cancelWrapScroll();
-                        }
-                        runOnPageScrollsInitialized(this::snapToDestination);
+                        runOnPageScrollsInitialized(this::snapToDestinationAfterDrag);
                     }
                 } else {
                     if (!mScroller.isFinished()) {
@@ -1572,10 +1525,7 @@ public abstract class PagedView<T extends View & PageIndicator> extends ViewGrou
 
         case MotionEvent.ACTION_CANCEL:
             if (mIsBeingDragged) {
-                if (isWrapScrolling()) {
-                    cancelWrapScroll();
-                }
-                runOnPageScrollsInitialized(this::snapToDestination);
+                runOnPageScrollsInitialized(this::snapToDestinationAfterDrag);
             }
             mEdgeGlowLeft.onRelease(ev);
             mEdgeGlowRight.onRelease(ev);
@@ -1618,6 +1568,7 @@ public abstract class PagedView<T extends View & PageIndicator> extends ViewGrou
         releaseVelocityTracker();
         mIsBeingDragged = false;
         mActivePointerId = INVALID_POINTER;
+        mWrapScroll.endGesture();
     }
 
     @Override
@@ -1781,85 +1732,19 @@ public abstract class PagedView<T extends View & PageIndicator> extends ViewGrou
         return (float) Math.sin(f);
     }
 
-    /**
-     * Initiates a wrap-scroll animation that moves one page distance in the correct swipe
-     * direction when wrapping between first↔last page.
-     */
-    private void snapToPageWrapped(int targetPage, int velocity) {
-        if (!mScroller.isFinished()) {
-            abortScrollerAnimation(false);
-        }
-        if (!isWrapScrolling()) {
-            startWrapDrag(targetPage);
-        }
-        if (!isWrapScrolling()) {
-            return;
-        }
-
-        int onePageDistance = getOnePageDistance();
-        if (onePageDistance == 0) {
-            finalizeWrapScroll();
-            return;
-        }
-
-        int currentScroll = mOrientationHandler.getPrimaryScroll(this);
-        // In LTR: wrapping to page 0 means target is to the right (beyond maxScroll).
-        // In RTL: directions are reversed.
-        int virtualTarget = ((targetPage == 0) != mIsRtl)
-                ? mSavedMaxScroll + onePageDistance
-                : mSavedMinScroll - onePageDistance;
-        int delta = virtualTarget - currentScroll;
-        int duration = computeSnapDuration(delta, velocity);
-
-        mNextPage = validateNewPage(targetPage);
-        pageBeginTransition();
-        mScroller.startScroll(currentScroll, 0, delta, 0, duration);
-        updatePageIndicator();
-        invalidate();
+    private void snapAfterDrag(int targetPage, int velocity, boolean wrap) {
+        runOnPageScrollsInitialized(() -> {
+            if (wrap && mWrapScroll.settleToPage(targetPage, velocity)) {
+                return;
+            }
+            mWrapScroll.cancelDrag();
+            snapToPageWithVelocity(targetPage, velocity);
+        });
     }
 
-    /**
-     * Resets wrap-scroll state: clears translation, restores scroll bounds, and jumps
-     * scroll position to the target page's real location.
-     */
-    private void finalizeWrapScroll() {
-        if (!isWrapScrolling()) {
-            return;
-        }
-        int targetPage = mWrapToPage;
-        mWrapToPage = INVALID_PAGE;
-
-        View targetView = getPageAt(targetPage);
-        if (targetView != null) {
-            targetView.setTranslationX(0);
-        }
-
-        mMinScroll = mSavedMinScroll;
-        mMaxScroll = mSavedMaxScroll;
-
-        int targetScroll = getScrollForPage(targetPage);
-        mOrientationHandler.setPrimary(this, VIEW_SCROLL_TO, targetScroll);
-    }
-
-    /**
-     * Cancels wrap-scroll state without jumping scroll position.
-     * Used when the user drags back or the gesture is cancelled, so the subsequent
-     * snapToPage animates from the current drag position instead of jumping first.
-     */
-    private void cancelWrapScroll() {
-        if (!isWrapScrolling()) {
-            return;
-        }
-        View targetView = getPageAt(mWrapToPage);
-        if (targetView != null) {
-            targetView.setTranslationX(0);
-        }
-        mWrapToPage = INVALID_PAGE;
-        int clamped = Utilities.boundToRange(
-                mOrientationHandler.getPrimaryScroll(this), mSavedMinScroll, mSavedMaxScroll);
-        mOrientationHandler.setPrimary(this, VIEW_SCROLL_TO, clamped);
-        mMinScroll = mSavedMinScroll;
-        mMaxScroll = mSavedMaxScroll;
+    private void snapToDestinationAfterDrag() {
+        mWrapScroll.cancelDrag();
+        snapToDestination();
     }
 
     /**
@@ -1867,22 +1752,7 @@ public abstract class PagedView<T extends View & PageIndicator> extends ViewGrou
      * Maps out-of-bounds scroll values back into the normal range so dots animate correctly.
      */
     protected int getScrollForPageIndicator() {
-        int scroll = getScrollX();
-        if (!isWrapScrolling() || !isPageScrollsInitialized() || getChildCount() < 2) {
-            return scroll;
-        }
-        int onePageDistance = getOnePageDistance();
-        if (onePageDistance == 0) {
-            return scroll;
-        }
-        int totalRange = computeMaxScroll() + onePageDistance;
-        if (scroll > mSavedMaxScroll) {
-            return scroll - totalRange;
-        }
-        if (scroll < mSavedMinScroll) {
-            return scroll + totalRange;
-        }
-        return scroll;
+        return mWrapScroll.getScrollForPageIndicator(getScrollX());
     }
 
     /**
@@ -1891,36 +1761,12 @@ public abstract class PagedView<T extends View & PageIndicator> extends ViewGrou
      * scroll range in the opposite direction so it slides continuously from one edge to the
      * other (matching the pre-wrap-animation behavior and other launchers like Nova).
      */
-    public int getScrollForWallpaper() {
-        int scroll = getScrollX();
-        if (!isWrapScrolling() || !isPageScrollsInitialized() || getChildCount() < 2) {
-            return scroll;
-        }
-        int onePageDistance = getOnePageDistance();
-        if (onePageDistance == 0) {
-            return scroll;
-        }
-        int scrollRange = mSavedMaxScroll - mSavedMinScroll;
-        if (scroll > mSavedMaxScroll) {
-            float progress = (float) (scroll - mSavedMaxScroll) / onePageDistance;
-            return Math.round(mSavedMaxScroll - progress * scrollRange);
-        }
-        if (scroll < mSavedMinScroll) {
-            float progress = (float) (mSavedMinScroll - scroll) / onePageDistance;
-            return Math.round(mSavedMinScroll + progress * scrollRange);
-        }
-        return scroll;
-    }
-
-    // Returns 0 on two-panel (foldable) workspaces, disabling wrap scroll.
-    private int getOnePageDistance() {
-        if (!isPageScrollsInitialized() || mPageScrolls.length < 2) {
-            return 0;
-        }
-        return Math.abs(mPageScrolls[1] - mPageScrolls[0]);
+    protected int getScrollForWallpaper() {
+        return mWrapScroll.getScrollForWallpaper(getScrollX());
     }
 
     protected boolean snapToPageWithVelocity(int whichPage, int velocity) {
+        mWrapScroll.prepareForNormalSnap();
         whichPage = validateNewPage(whichPage);
 
         final int newLoc = getScrollForPage(whichPage);
@@ -1938,37 +1784,256 @@ public abstract class PagedView<T extends View & PageIndicator> extends ViewGrou
         return snapToPage(whichPage, delta, duration);
     }
 
-    /**
-     * Begins a wrap-drag by translating the target page's View next to the current page
-     * and extending scroll bounds so scrollTo doesn't clamp.
-     */
-    private void startWrapDrag(int targetPage) {
-        if (!isPageScrollsInitialized() || getChildCount() < 2 || isWrapScrolling()) {
-            return;
-        }
-        int onePageDistance = getOnePageDistance();
-        if (onePageDistance == 0) {
-            return;
-        }
-        View targetView = getPageAt(targetPage);
-        if (targetView == null) {
-            return;
+
+    /** Owns all transient state and coordinate mapping for an animated page wrap. */
+    private final class WrapScrollController {
+        private static final int STATE_IDLE = 0;
+        private static final int STATE_DRAGGING = 1;
+        private static final int STATE_SETTLING = 2;
+
+        private int mState = STATE_IDLE;
+        private int mTargetPage = INVALID_PAGE;
+        private int mSavedMinScroll;
+        private int mSavedMaxScroll;
+        private int mTranslationX;
+        private float mOriginalTranslationX;
+        @Nullable private View mTargetView;
+
+        private boolean mGestureStarted;
+        private boolean mEnabledForGesture;
+        private boolean mCanWrapFromFirstPageForGesture;
+
+        void beginGesture() {
+            mGestureStarted = true;
+            mEnabledForGesture = !mFreeScroll
+                    && getChildCount() > 1
+                    && isPageWrappingEnabled();
+            mCanWrapFromFirstPageForGesture = mEnabledForGesture
+                    && canWrapFromFirstPage();
         }
 
-        int totalWidth = mMaxScroll - mMinScroll + onePageDistance;
-        mSavedMinScroll = mMinScroll;
-        mSavedMaxScroll = mMaxScroll;
-        mWrapToPage = targetPage;
+        void ensureGestureStarted() {
+            if (!mGestureStarted) {
+                beginGesture();
+            }
+        }
 
-        // In LTR: page 0 is leftmost. Wrapping to page 0 from last page means we place
-        // page 0 to the right of the last page (positive translation).
-        // In RTL: page 0 is rightmost, so wrapping to page 0 means placing it to the left.
-        if ((targetPage == 0) != mIsRtl) {
-            targetView.setTranslationX(totalWidth);
-            mMaxScroll = mSavedMaxScroll + onePageDistance;
-        } else {
-            targetView.setTranslationX(-totalWidth);
-            mMinScroll = mSavedMinScroll - onePageDistance;
+        void endGesture() {
+            mGestureStarted = false;
+            mEnabledForGesture = false;
+            mCanWrapFromFirstPageForGesture = false;
+        }
+
+        boolean isActive() {
+            return mState != STATE_IDLE;
+        }
+
+        boolean isSettling() {
+            return mState == STATE_SETTLING;
+        }
+
+        boolean isEnabledForGesture() {
+            return mEnabledForGesture;
+        }
+
+        boolean canWrapFromFirstPageForGesture() {
+            return mCanWrapFromFirstPageForGesture;
+        }
+
+        int getLastPage() {
+            return getChildCount() == 0
+                    ? 0 : getLeftmostVisiblePageForIndex(getChildCount() - 1);
+        }
+
+        void maybeStartDrag(int oldScroll, int delta) {
+            if (!mEnabledForGesture || isActive() || !canAnimateWrap()) {
+                return;
+            }
+
+            int pulledTo = oldScroll + delta;
+            if (mCurrentPage == getLastPage()) {
+                boolean pastEnd = mIsRtl ? pulledTo < mMinScroll : pulledTo > mMaxScroll;
+                if (pastEnd) {
+                    startDrag(0);
+                }
+            } else if (mCurrentPage == 0 && mCanWrapFromFirstPageForGesture) {
+                boolean pastStart = mIsRtl ? pulledTo > mMaxScroll : pulledTo < mMinScroll;
+                if (pastStart) {
+                    startDrag(getLastPage());
+                }
+            }
+        }
+
+        boolean settleToPage(int targetPage, int velocity) {
+            if (!isActive() && !startDrag(targetPage)) {
+                return false;
+            }
+            if (mState != STATE_DRAGGING || targetPage != mTargetPage) {
+                cancelDrag();
+                return false;
+            }
+
+            int onePageDistance = getOnePageDistance();
+            if (onePageDistance == 0) {
+                cancelDrag();
+                return false;
+            }
+
+            int currentScroll = mOrientationHandler.getPrimaryScroll(PagedView.this);
+            int virtualTarget = ((targetPage == 0) != mIsRtl)
+                    ? mSavedMaxScroll + onePageDistance
+                    : mSavedMinScroll - onePageDistance;
+            int delta = virtualTarget - currentScroll;
+            int duration = computeSnapDuration(delta, velocity);
+
+            mState = STATE_SETTLING;
+            mNextPage = validateNewPage(targetPage);
+            pageBeginTransition();
+            mScroller.startScroll(currentScroll, 0, delta, 0, duration);
+            updatePageIndicator();
+            invalidate();
+            return true;
+        }
+
+        void cancelDrag() {
+            if (!isActive()) {
+                return;
+            }
+
+            restoreTargetTranslation();
+            int clamped = Utilities.boundToRange(
+                    mOrientationHandler.getPrimaryScroll(PagedView.this),
+                    mSavedMinScroll,
+                    mSavedMaxScroll);
+            mOrientationHandler.setPrimary(PagedView.this, VIEW_SCROLL_TO, clamped);
+            restoreBoundsAndClearState();
+        }
+
+        void onScrollerStopped() {
+            if (mState == STATE_SETTLING) {
+                completeAndCommit();
+            } else if (mState == STATE_DRAGGING) {
+                cancelDrag();
+            }
+        }
+
+        void prepareForNormalSnap() {
+            if (mState == STATE_SETTLING) {
+                abortScrollerAnimation(false);
+            } else {
+                cancelDrag();
+            }
+        }
+
+        int getTranslationForPage(int page) {
+            return isActive() && page == mTargetPage ? mTranslationX : 0;
+        }
+
+        int getScrollForPageIndicator(int scroll) {
+            int onePageDistance = getOnePageDistance();
+            if (!isActive() || onePageDistance == 0) {
+                return scroll;
+            }
+
+            int totalRange = mSavedMaxScroll - mSavedMinScroll + onePageDistance;
+            if (scroll > mSavedMaxScroll) {
+                return scroll - totalRange;
+            }
+            if (scroll < mSavedMinScroll) {
+                return scroll + totalRange;
+            }
+            return scroll;
+        }
+
+        int getScrollForWallpaper(int scroll) {
+            int onePageDistance = getOnePageDistance();
+            if (!isActive() || onePageDistance == 0) {
+                return scroll;
+            }
+
+            int scrollRange = mSavedMaxScroll - mSavedMinScroll;
+            if (scroll > mSavedMaxScroll) {
+                float progress = (float) (scroll - mSavedMaxScroll) / onePageDistance;
+                return Math.round(mSavedMaxScroll - progress * scrollRange);
+            }
+            if (scroll < mSavedMinScroll) {
+                float progress = (float) (mSavedMinScroll - scroll) / onePageDistance;
+                return Math.round(mSavedMinScroll + progress * scrollRange);
+            }
+            return scroll;
+        }
+
+        private boolean canAnimateWrap() {
+            return getPanelCount() == 1 && getOnePageDistance() > 0;
+        }
+
+        private int getOnePageDistance() {
+            int nextPageGroup = getPanelCount();
+            if (!isPageScrollsInitialized() || mPageScrolls.length <= nextPageGroup) {
+                return 0;
+            }
+            return Math.abs(getScrollForPage(nextPageGroup) - getScrollForPage(0));
+        }
+
+        private boolean startDrag(int targetPage) {
+            if (isActive() || !canAnimateWrap()) {
+                return false;
+            }
+
+            View targetView = getPageAt(targetPage);
+            if (targetView == null) {
+                return false;
+            }
+
+            int onePageDistance = getOnePageDistance();
+            int totalWidth = mMaxScroll - mMinScroll + onePageDistance;
+            mSavedMinScroll = mMinScroll;
+            mSavedMaxScroll = mMaxScroll;
+            mTargetPage = targetPage;
+            mTargetView = targetView;
+            mOriginalTranslationX = targetView.getTranslationX();
+
+            if ((targetPage == 0) != mIsRtl) {
+                mTranslationX = totalWidth;
+                mMaxScroll = mSavedMaxScroll + onePageDistance;
+            } else {
+                mTranslationX = -totalWidth;
+                mMinScroll = mSavedMinScroll - onePageDistance;
+            }
+            targetView.setTranslationX(mOriginalTranslationX + mTranslationX);
+            mState = STATE_DRAGGING;
+            return true;
+        }
+
+        private void completeAndCommit() {
+            int targetPage = mTargetPage;
+            restoreTargetTranslation();
+            restoreBoundsAndClearState();
+            mOrientationHandler.setPrimary(
+                    PagedView.this, VIEW_SCROLL_TO, getScrollForPage(targetPage));
+
+            int previousPage = mCurrentPage;
+            mCurrentPage = validateNewPage(targetPage);
+            mCurrentScrollOverPage = mCurrentPage;
+            mNextPage = INVALID_PAGE;
+            notifyPageSwitchListener(previousPage);
+            pageEndTransition();
+        }
+
+        private void restoreTargetTranslation() {
+            if (mTargetView != null) {
+                mTargetView.setTranslationX(mOriginalTranslationX);
+            }
+        }
+
+        private void restoreBoundsAndClearState() {
+            mMinScroll = mSavedMinScroll;
+            mMaxScroll = mSavedMaxScroll;
+            mState = STATE_IDLE;
+            mTargetPage = INVALID_PAGE;
+            mTargetView = null;
+            mTranslationX = 0;
+            mOriginalTranslationX = 0;
         }
     }
 
@@ -2008,6 +2073,7 @@ public abstract class PagedView<T extends View & PageIndicator> extends ViewGrou
     }
 
     protected boolean snapToPage(int whichPage, int duration, boolean immediate) {
+        mWrapScroll.prepareForNormalSnap();
         whichPage = validateNewPage(whichPage);
 
         int newLoc = getScrollForPage(whichPage);

@@ -1027,6 +1027,16 @@ public class Workspace<T extends View & PageIndicator> extends PagedView<T>
         return isTwoPanelEnabled() ? 2 : super.getPanelCount();
     }
 
+    @Override
+    protected boolean isPageWrappingEnabled() {
+        return mPreferenceManger.getInfiniteScrolling().get();
+    }
+
+    @Override
+    protected boolean canWrapFromFirstPage() {
+        return !PreferenceExtensionsKt.firstBlocking(mPreferenceManager2.getEnableFeed());
+    }
+
     public IntSet getCurrentPageScreenIds() {
         return IntSet.wrap(getScreenIdForPageIndex(getCurrentPage()));
     }
@@ -1437,6 +1447,11 @@ public class Workspace<T extends View & PageIndicator> extends PagedView<T>
             var isHotseatEnabled = PreferenceExtensionsKt.firstBlocking(mPreferenceManager2.isHotseatEnabled());
             mPageIndicator.setVisibility(isHotseatEnabled ? VISIBLE : INVISIBLE);
         }
+    }
+
+    @Override
+    public int getScrollForWallpaper() {
+        return super.getScrollForWallpaper();
     }
 
     @Override
